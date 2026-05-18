@@ -1,8 +1,7 @@
-// frontend/src/hooks/useWebSocket.js
 import { useEffect, useRef } from 'react'
 import { useSignalStore } from '../store/signalStore'
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/signals'
+const WS_URL = import.meta.env.VITE_WS_URL || 'wss://stock-signals-4fec.onrender.com/ws/signals'
 const RECONNECT_DELAY = 3000
 
 export function useWebSocket() {
@@ -24,7 +23,7 @@ export function useWebSocket() {
 
     ws.onmessage = (evt) => {
       try {
-        if (evt.data === 'pong') return   // plain text keepalive response
+        if (evt.data === 'pong') return
         const msg = JSON.parse(evt.data)
         switch (msg.type) {
           case 'new_signals':
@@ -59,7 +58,6 @@ export function useWebSocket() {
 
   useEffect(() => {
     connect()
-    // Keepalive ping every 25 s
     const pingInterval = setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send('ping')

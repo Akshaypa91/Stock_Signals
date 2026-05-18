@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: stock-signals
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        value: postgresql://iway:uye1epbxnIAPT4YJ5SZj32TVtqSJ1ClX@dpg-d85fjgog4nts73fug26g-a/investorsway
+      - key: REDIS_URL
+        value: redis://default:GO5yoB54DgKbwngkjxgwf4Oqfz0vPcYf@redis-18324.c275.us-east-1-4.ec2.cloud.redislabs.com:18324
+      - key: FRONTEND_URL
+        value: https://stock-signals-beta.vercel.app
+      - key: ALLOWED_ORIGINS
+        value: https://stock-signals-beta.vercel.app
+      - key: CAPITAL
+        value: "200000"
+      - key: RISK_PCT
+        value: "1.0"
+      - key: ATR_LEN
+        value: "14"
+      - key: SL_LOOKBACK
+        value: "5"
+      - key: UPSTOX_REDIRECT_URI
+        value: https://stock-signals-4fec.onrender.com/upstox/callback

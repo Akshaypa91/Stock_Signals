@@ -1,7 +1,6 @@
-// frontend/src/api/client.js
 import axios from 'axios'
 
-const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const BASE = import.meta.env.VITE_API_URL || 'https://stock-signals-4fec.onrender.com'
 
 export const api = axios.create({
   baseURL: BASE,
@@ -9,7 +8,6 @@ export const api = axios.create({
   headers: { 'Content-Type': 'application/json' },
 })
 
-// Response interceptor — log errors
 api.interceptors.response.use(
   r => r,
   err => {
@@ -18,7 +16,6 @@ api.interceptors.response.use(
   }
 )
 
-// --- Signals ---
 export const fetchTodaySignals = (strategy) =>
   api.get('/signals', { params: { strategy } }).then(r => r.data)
 
@@ -31,7 +28,6 @@ export const fetchSignal = (id) =>
 export const updateSignalStatus = (id, status) =>
   api.patch(`/signals/${id}/status`, null, { params: { status } }).then(r => r.data)
 
-// --- Trades ---
 export const fetchTrades = (params) =>
   api.get('/trades', { params }).then(r => r.data)
 
@@ -44,7 +40,6 @@ export const closeTrade = (id, body) =>
 export const deleteTrade = (id) =>
   api.delete(`/trades/${id}`).then(r => r.data)
 
-// --- Scanner ---
 export const triggerScan = (universe = 'both') =>
   api.post('/scanner/run', null, { params: { universe } }).then(r => r.data)
 

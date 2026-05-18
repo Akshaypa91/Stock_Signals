@@ -131,8 +131,8 @@ investors-way/
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/yourname/investors-way.git
-cd investors-way
+git clone https://github.com/Akshaypa91
+cd Stock_Signals
 cp .env.example .env
 ```
 

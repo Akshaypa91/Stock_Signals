@@ -1,0 +1,7 @@
+{
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
+  "env": {
+    "VITE_API_URL": "https://stock-signals-4fec.onrender.com",
+    "VITE_WS_URL": "wss://stock-signals-4fec.onrender.com/ws/signals"
+  }
+}
