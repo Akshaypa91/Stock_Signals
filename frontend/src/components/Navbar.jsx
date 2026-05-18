@@ -75,8 +75,8 @@ export default function Navbar() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
             </svg>
           </div>
-          <span className="text-white font-bold text-base tracking-tight">Investors Way</span>
-          <span className="text-slate-600 text-xs hidden sm:block">NSE Signals</span>
+          <span className="text-white font-bold text-base tracking-tight">Stock Signals</span>
+          {/* <span className="text-slate-600 text-xs hidden sm:block">NSE Signals</span> */}
         </div>
 
         {/* Nav links */}
