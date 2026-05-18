@@ -1,0 +1,25 @@
+/* frontend/src/index.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  body { @apply bg-slate-950 text-slate-100; font-family: 'Inter', system-ui, sans-serif; }
+  svg { display: inline-block; vertical-align: middle; }
+  img, svg { max-width: 100%; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-slate-900; }
+  ::-webkit-scrollbar-thumb { @apply bg-slate-600 rounded-full; }
+}
+
+@layer utilities {
+  .animate-ticker {
+    display: inline-flex;
+    animation: ticker linear infinite;
+  }
+  @keyframes ticker {
+    from { transform: translateX(0); }
+    to   { transform: translateX(-50%); }
+  }
+}
