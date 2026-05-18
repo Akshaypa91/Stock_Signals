@@ -1,4 +1,4 @@
-# Investors Way 📈
+# Stock Signals 📈
 
 A live trading signal dashboard for Indian equity markets (NSE).  
 Receives Chartink breakout alerts → fetches Upstox OHLCV → runs two strategies → displays Entry / SL / T1 / T2 levels on a real-time React dashboard.
