@@ -23,6 +23,7 @@ from api.stocks import router as signals_router
 from api.trades import router as trades_router
 from api.scanner import router as scanner_router
 from api.websocket_manager import ws_manager
+from upstox.instruments import instruments_router
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -99,6 +100,7 @@ app.include_router(webhook_router)
 app.include_router(signals_router)
 app.include_router(trades_router)
 app.include_router(scanner_router)
+app.include_router(instruments_router)
 
 
 # ---------------------------------------------------------------------------
