@@ -3,17 +3,19 @@ upstox/auth.py
 ==============
 Upstox OAuth2 token manager.
 
-Flow:
-  1. User visits GET /upstox/login  → redirected to Upstox consent page
-  2. Upstox redirects back to REDIRECT_URI with ?code=...
-  3. GET /upstox/callback exchanges code → access_token + refresh_token
-  4. Tokens stored in Redis (access_token TTL = 23 h, refresh kept indefinitely)
-  5. Every API call uses get_access_token() which auto-refreshes when near expiry
+Two ways to authenticate:
+  1. OAuth flow  : GET /upstox/login → consent → callback → token saved
+  2. Manual token: POST /upstox/save-token → paste token directly (simplest)
+
+Manual token flow (recommended):
+  - Go to account.upstox.com → Developer Apps → your app → copy Access Token
+  - POST it to /upstox/save-token
+  - Valid for 1 day — do this every morning before market opens
 
 Redis keys:
-  upstox:access_token   → str
-  upstox:refresh_token  → str
-  upstox:token_expiry   → ISO-8601 datetime str
+  upstox:access_token  → str
+  upstox:refresh_token → str
+  upstox:token_expiry  → ISO-8601 datetime str
 """
 
 import logging
@@ -25,43 +27,124 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 
 from redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config (pulled from environment / .env via main.py lifespan)
+# Config
 # ---------------------------------------------------------------------------
-UPSTOX_API_KEY: str = os.environ["UPSTOX_API_KEY"]
-UPSTOX_API_SECRET: str = os.environ["UPSTOX_API_SECRET"]
-UPSTOX_REDIRECT_URI: str = os.environ["UPSTOX_REDIRECT_URI"]
+UPSTOX_API_KEY: str = os.environ.get("UPSTOX_API_KEY", "")
+UPSTOX_API_SECRET: str = os.environ.get("UPSTOX_API_SECRET", "")
+UPSTOX_REDIRECT_URI: str = os.environ.get("UPSTOX_REDIRECT_URI", "")
 
 BASE_URL = "https://api.upstox.com"
 AUTH_URL = f"{BASE_URL}/v2/login/authorization/dialog"
 TOKEN_URL = f"{BASE_URL}/v2/login/authorization/token"
-REFRESH_URL = f"{BASE_URL}/v2/login/authorization/token"   # same endpoint, different grant
+REFRESH_URL = f"{BASE_URL}/v2/login/authorization/token"
 
-# Refresh when less than this many minutes remain on the token
 REFRESH_BUFFER_MINUTES = 60
 
 # Redis keys
-_KEY_ACCESS = "upstox:access_token"
+_KEY_ACCESS  = "upstox:access_token"
 _KEY_REFRESH = "upstox:refresh_token"
-_KEY_EXPIRY = "upstox:token_expiry"
+_KEY_EXPIRY  = "upstox:token_expiry"
 
 # ---------------------------------------------------------------------------
-# FastAPI router  (mounted in main.py)
+# Router
 # ---------------------------------------------------------------------------
 router = APIRouter(prefix="/upstox", tags=["upstox-auth"])
 
 
-@router.get("/login", summary="Redirect to Upstox OAuth2 consent page")
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+class TokenInput(BaseModel):
+    access_token: str
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@router.post("/save-token", summary="Manually save Upstox access token")
+async def save_token(body: TokenInput) -> dict:
+    """
+    Simplest way to authenticate — no OAuth flow needed.
+
+    Steps:
+      1. Go to account.upstox.com → Developer Apps → your app
+      2. Copy the Access Token shown there
+      3. POST it here
+
+    Do this every morning before market opens (token lasts 1 day).
+    """
+    if not body.access_token or len(body.access_token) < 10:
+        raise HTTPException(status_code=400, detail="Invalid token — too short")
+
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=23)
+
+    redis = await get_redis()
+    pipe = redis.pipeline()
+    pipe.set(_KEY_ACCESS, body.access_token, ex=82800)  # 23h TTL
+    pipe.set(_KEY_EXPIRY, expires_at.isoformat())
+    await pipe.execute()
+
+    logger.info("Access token manually saved, expires at %s", expires_at.isoformat())
+    return {
+        "status": "ok",
+        "message": "Token saved successfully. Valid until tomorrow morning.",
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@router.get("/status", summary="Check current token status")
+async def token_status() -> dict:
+    """Returns whether a valid token is currently stored in Redis."""
+    redis = await get_redis()
+    access_token = await redis.get(_KEY_ACCESS)
+    expiry_str   = await redis.get(_KEY_EXPIRY)
+
+    if not access_token:
+        return {
+            "authenticated": False,
+            "message": "No token found. POST to /upstox/save-token to authenticate.",
+        }
+
+    expiry = datetime.fromisoformat(expiry_str) if expiry_str else None
+    now    = datetime.now(timezone.utc)
+    minutes_left = int((expiry - now).total_seconds() / 60) if expiry else 0
+
+    return {
+        "authenticated": True,
+        "expires_at": expiry_str,
+        "minutes_remaining": minutes_left,
+        "needs_refresh": minutes_left < REFRESH_BUFFER_MINUTES,
+        "token_preview": access_token[:20] + "..." if access_token else None,
+    }
+
+
+@router.delete("/logout", summary="Remove stored tokens from Redis")
+async def upstox_logout() -> dict:
+    """Clears stored tokens. You will need to re-authenticate."""
+    redis = await get_redis()
+    await redis.delete(_KEY_ACCESS, _KEY_REFRESH, _KEY_EXPIRY)
+    logger.info("Upstox tokens cleared from Redis")
+    return {"status": "ok", "message": "Tokens cleared"}
+
+
+@router.get("/login", summary="Redirect to Upstox OAuth2 consent page (alternative)")
 async def upstox_login() -> RedirectResponse:
     """
-    Start OAuth2 flow.  Visit this URL in a browser to authorise the app.
-    After consent Upstox redirects to REDIRECT_URI?code=<auth_code>.
+    Alternative OAuth2 flow. Visit this URL in a browser.
+    After consent Upstox redirects to REDIRECT_URI?code=...
+    Simpler option: use POST /upstox/save-token instead.
     """
+    if not UPSTOX_API_KEY:
+        raise HTTPException(status_code=500, detail="UPSTOX_API_KEY not configured")
+
     params = {
         "response_type": "code",
         "client_id": UPSTOX_API_KEY,
@@ -72,15 +155,14 @@ async def upstox_login() -> RedirectResponse:
     return RedirectResponse(url=consent_url)
 
 
-@router.get("/callback", summary="Exchange auth code for tokens")
+@router.get("/callback", summary="Exchange auth code for tokens (OAuth2 callback)")
 async def upstox_callback(request: Request):
     """
-    Upstox redirects here after user grants consent.
-    Exchanges the auth-code for access + refresh tokens and stores them in Redis.
-    Then redirects the popup to the frontend /auth/callback page.
+    Upstox redirects here after OAuth2 consent.
+    Exchanges auth-code for access token and stores in Redis.
     """
     frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
-    code: Optional[str] = request.query_params.get("code")
+    code:  Optional[str] = request.query_params.get("code")
     error: Optional[str] = request.query_params.get("error")
 
     if error:
@@ -93,87 +175,54 @@ async def upstox_callback(request: Request):
     try:
         token_data = await _exchange_code(code)
         await _store_tokens(token_data)
-        logger.info("Upstox authenticated successfully")
+        logger.info("OAuth token obtained successfully")
         return RedirectResponse(url=f"{frontend_url}/auth/callback?success=1")
     except Exception as e:
         logger.error("Token exchange error: %s", e)
         return RedirectResponse(url=f"{frontend_url}/auth/callback?error=token_exchange_failed")
 
 
-@router.get("/status", summary="Check current token status")
-async def token_status() -> dict:
-    """Returns whether a valid token is currently stored in Redis."""
-    redis = await get_redis()
-    access_token = await redis.get(_KEY_ACCESS)
-    expiry_str = await redis.get(_KEY_EXPIRY)
-
-    if not access_token:
-        return {"authenticated": False, "message": "No access token found"}
-
-    expiry = datetime.fromisoformat(expiry_str) if expiry_str else None
-    now = datetime.now(timezone.utc)
-    minutes_left = int((expiry - now).total_seconds() / 60) if expiry else 0
-
-    return {
-        "authenticated": True,
-        "expires_at": expiry_str,
-        "minutes_remaining": minutes_left,
-        "needs_refresh": minutes_left < REFRESH_BUFFER_MINUTES,
-    }
-
-
-@router.delete("/logout", summary="Remove stored tokens from Redis")
-async def upstox_logout() -> dict:
-    """Clears stored tokens. User will need to re-authenticate."""
-    redis = await get_redis()
-    await redis.delete(_KEY_ACCESS, _KEY_REFRESH, _KEY_EXPIRY)
-    logger.info("Upstox tokens cleared from Redis")
-    return {"status": "ok", "message": "Tokens cleared"}
-
-
 # ---------------------------------------------------------------------------
-# Core helper — used by every other module that needs a token
+# Core helper — used by every module that needs a token
 # ---------------------------------------------------------------------------
+
 async def get_access_token() -> str:
     """
-    Returns a valid Upstox access token.
-
-    Logic:
-      1. Load token + expiry from Redis.
-      2. If expiry is within REFRESH_BUFFER_MINUTES, silently refresh.
-      3. If no token at all, raise AuthenticationError.
+    Returns a valid Upstox access token from Redis.
 
     Raises:
-        UpstoxAuthError: when no token exists and user must re-authenticate.
+        UpstoxAuthError: when no token exists — call POST /upstox/save-token
     """
     redis = await get_redis()
 
     access_token: Optional[str] = await redis.get(_KEY_ACCESS)
-    expiry_str: Optional[str] = await redis.get(_KEY_EXPIRY)
+    expiry_str:   Optional[str] = await redis.get(_KEY_EXPIRY)
 
     if not access_token:
         raise UpstoxAuthError(
-            "No Upstox access token found. "
-            "Please visit /upstox/login to authenticate."
+            "No Upstox token found. "
+            "POST your token to /upstox/save-token to authenticate."
         )
 
-    # Check if refresh needed
+    # Auto-refresh via OAuth refresh_token if near expiry
     if expiry_str:
         expiry = datetime.fromisoformat(expiry_str)
-        now = datetime.now(timezone.utc)
+        now    = datetime.now(timezone.utc)
         minutes_left = (expiry - now).total_seconds() / 60
 
         if minutes_left < REFRESH_BUFFER_MINUTES:
-            logger.info(
-                "Access token expires in %.0f min — refreshing now", minutes_left
-            )
-            access_token = await _refresh_access_token()
+            logger.info("Token expires in %.0f min — attempting refresh", minutes_left)
+            try:
+                access_token = await _refresh_access_token()
+            except UpstoxAuthError:
+                # Refresh failed — token still usable until it actually expires
+                logger.warning("Refresh failed — using existing token")
 
     return access_token
 
 
 async def get_auth_headers() -> dict:
-    """Returns the Authorization header dict required by Upstox API v2."""
+    """Returns Authorization header dict required by Upstox API v2."""
     token = await get_access_token()
     return {
         "Authorization": f"Bearer {token}",
@@ -185,6 +234,7 @@ async def get_auth_headers() -> dict:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
 async def _exchange_code(code: str) -> dict:
     """POST to Upstox token endpoint and return parsed token payload."""
     payload = {
@@ -199,37 +249,32 @@ async def _exchange_code(code: str) -> dict:
         resp = await client.post(TOKEN_URL, data=payload)
 
     if resp.status_code != 200:
-        logger.error(
-            "Token exchange failed: %s %s", resp.status_code, resp.text
-        )
+        logger.error("Token exchange failed: %s %s", resp.status_code, resp.text)
         raise HTTPException(
             status_code=502,
             detail=f"Upstox token exchange failed: {resp.text}",
         )
 
     data = resp.json()
-    # Upstox returns expires_in (seconds from now)
     expires_in: int = data.get("expires_in", 86400)
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-    data["expires_at"] = expires_at.isoformat()
+    data["expires_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    ).isoformat()
 
-    logger.info("Token obtained, expires at %s", data["expires_at"])
+    logger.info("OAuth token obtained, expires at %s", data["expires_at"])
     return data
 
 
 async def _refresh_access_token() -> str:
     """
-    Uses the stored refresh_token to obtain a new access_token.
-    Stores the new token pair in Redis.
-    Returns the new access_token string.
+    Uses stored refresh_token to get a new access_token.
+    Only works with OAuth flow tokens — not manually saved tokens.
     """
     redis = await get_redis()
     refresh_token: Optional[str] = await redis.get(_KEY_REFRESH)
 
     if not refresh_token:
-        raise UpstoxAuthError(
-            "No refresh token available. Please re-authenticate via /upstox/login."
-        )
+        raise UpstoxAuthError("No refresh token — re-authenticate via /upstox/save-token")
 
     payload = {
         "refresh_token": refresh_token,
@@ -242,56 +287,45 @@ async def _refresh_access_token() -> str:
         resp = await client.post(REFRESH_URL, data=payload)
 
     if resp.status_code != 200:
-        logger.error(
-            "Token refresh failed: %s %s", resp.status_code, resp.text
-        )
-        # Token may be fully expired — force re-auth
+        logger.error("Token refresh failed: %s %s", resp.status_code, resp.text)
         await redis.delete(_KEY_ACCESS, _KEY_REFRESH, _KEY_EXPIRY)
-        raise UpstoxAuthError(
-            "Token refresh failed. Please re-authenticate via /upstox/login."
-        )
+        raise UpstoxAuthError("Token refresh failed — re-authenticate via /upstox/save-token")
 
     data = resp.json()
     expires_in: int = data.get("expires_in", 86400)
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-    data["expires_at"] = expires_at.isoformat()
+    data["expires_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    ).isoformat()
 
     await _store_tokens(data)
-    logger.info("Token refreshed successfully, expires at %s", data["expires_at"])
+    logger.info("Token refreshed, expires at %s", data["expires_at"])
     return data["access_token"]
 
 
 async def _store_tokens(token_data: dict) -> None:
-    """
-    Persists access_token, refresh_token, and expiry in Redis.
-    access_token TTL is set to (expires_in - 300) seconds so Redis auto-evicts it
-    slightly before Upstox does, keeping get_access_token() as the source of truth.
-    """
+    """Persists access_token, refresh_token, expiry in Redis."""
     redis = await get_redis()
 
-    access_token: str = token_data["access_token"]
+    access_token:  str           = token_data["access_token"]
     refresh_token: Optional[str] = token_data.get("refresh_token")
-    expires_at: str = token_data["expires_at"]
-    expires_in: int = token_data.get("expires_in", 86400)
+    expires_at:    str           = token_data["expires_at"]
+    expires_in:    int           = token_data.get("expires_in", 86400)
 
-    # TTL for Redis key: slightly shorter than actual token lifetime
     access_ttl = max(expires_in - 300, 300)
 
     pipe = redis.pipeline()
     pipe.set(_KEY_ACCESS, access_token, ex=access_ttl)
     pipe.set(_KEY_EXPIRY, expires_at)
     if refresh_token:
-        # Refresh tokens don't expire on a fixed schedule; keep indefinitely
         pipe.set(_KEY_REFRESH, refresh_token)
     await pipe.execute()
 
-    logger.debug(
-        "Stored tokens: access_ttl=%ds, expiry=%s", access_ttl, expires_at
-    )
+    logger.debug("Tokens stored: ttl=%ds expiry=%s", access_ttl, expires_at)
 
 
 # ---------------------------------------------------------------------------
 # Custom exception
 # ---------------------------------------------------------------------------
+
 class UpstoxAuthError(Exception):
     """Raised when a valid Upstox access token cannot be obtained."""
