@@ -8,6 +8,7 @@ Uses asyncpg driver (postgresql+asyncpg://...).
 import logging
 import os
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -85,11 +86,41 @@ async def get_db() -> AsyncSession:
 # Init helper called from main.py lifespan
 # ---------------------------------------------------------------------------
 async def init_db() -> None:
-    """Create all tables if they don't exist (idempotent)."""
+    """Create all tables if they don't exist, and apply incremental migrations."""
     from models import signal, trade  # noqa: F401 — registers models
     async with engine.begin() as conn:
+        # Create any missing tables (idempotent)
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables initialised")
+
+        # Migration: add sl_label column (Indian market SL quality: Good/OK/Wide)
+        await conn.execute(text(
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS sl_label VARCHAR(20)"
+        ))
+
+        # Migration: add timeframe column (Weekly (NSE) / Daily (NSE))
+        await conn.execute(text(
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe VARCHAR(20)"
+        ))
+
+        # Backfill sl_label for any existing rows that don't have it yet
+        await conn.execute(text("""
+            UPDATE signals
+            SET sl_label = CASE
+                WHEN sl_pct <= 8  THEN 'Good'
+                WHEN sl_pct <= 12 THEN 'OK'
+                ELSE 'Wide — Skip'
+            END
+            WHERE sl_label IS NULL AND sl_pct IS NOT NULL
+        """))
+
+        # Backfill timeframe for existing rows (all were daily scans)
+        await conn.execute(text("""
+            UPDATE signals
+            SET timeframe = 'Daily (NSE)'
+            WHERE timeframe IS NULL
+        """))
+
+    logger.info("Database tables initialised and migrations applied")
 
 
 async def close_db() -> None:

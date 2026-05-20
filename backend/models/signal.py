@@ -18,11 +18,13 @@ class Signal(Base):
     t1: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     t2: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     sl_pct: Mapped[float] = mapped_column(Numeric(5, 2), nullable=True)
+    sl_label: Mapped[str] = mapped_column(String(20), nullable=True)      # Good / OK / Wide—Skip
     rr1: Mapped[float] = mapped_column(Numeric(4, 2), nullable=True)
     rr2: Mapped[float] = mapped_column(Numeric(4, 2), nullable=True)
     qty: Mapped[int] = mapped_column(Integer, nullable=True)
     qty_half: Mapped[int] = mapped_column(Integer, nullable=True)
     atr: Mapped[float] = mapped_column(Numeric(10, 2), nullable=True)
+    timeframe: Mapped[str] = mapped_column(String(20), nullable=True)     # Weekly (NSE) / Daily (NSE)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -38,11 +40,13 @@ class Signal(Base):
             "t1": float(self.t1),
             "t2": float(self.t2),
             "sl_pct": float(self.sl_pct) if self.sl_pct else None,
+            "sl_label": self.sl_label,
             "rr1": float(self.rr1) if self.rr1 else None,
             "rr2": float(self.rr2) if self.rr2 else None,
             "qty": self.qty,
             "qty_half": self.qty_half,
             "atr": float(self.atr) if self.atr else None,
+            "timeframe": self.timeframe,
             "status": self.status,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

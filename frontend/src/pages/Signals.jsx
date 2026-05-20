@@ -10,26 +10,42 @@ const STATUS_BADGE = {
   time_stop: 'bg-orange-500/20 text-orange-300',
 }
 
+// SL label → colour
+const SL_LABEL_COLOR = {
+  'Good':        'text-emerald-400',
+  'OK':          'text-amber-400',
+  'Wide — Skip': 'text-red-400',
+}
+
 function exportCSV(signals) {
-  const headers = ['ID','Symbol','Strategy','Date','Entry','SL','T1','T2','SL%','RR1','RR2','Qty','Status']
-  const rows = signals.map(s => [s.id,s.symbol,s.strategy,s.signal_date,s.entry,s.sl,s.t1,s.t2,s.sl_pct,s.rr1,s.rr2,s.qty,s.status])
-  const csv = [headers,...rows].map(r=>r.join(',')).join('\n')
+  const headers = ['ID','Symbol','Strategy','Date','Entry','SL','SL%','SL Label','T1','T2','RR1','RR2','Qty','Timeframe','Status']
+  const rows = signals.map(s => [
+    s.id, s.symbol, s.strategy, s.signal_date,
+    s.entry, s.sl, s.sl_pct, s.sl_label,
+    s.t1, s.t2, s.rr1, s.rr2, s.qty,
+    s.timeframe, s.status,
+  ])
+  const csv = [headers, ...rows].map(r => r.join(',')).join('\n')
   const a = document.createElement('a')
-  a.href = URL.createObjectURL(new Blob([csv],{type:'text/csv'}))
-  a.download = `signals-${new Date().toISOString().slice(0,10)}.csv`
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
+  a.download = `signals-${new Date().toISOString().slice(0, 10)}.csv`
   a.click()
 }
 
-// Mobile signal card for small screens
+// Mobile signal card
 function SignalMobileCard({ sig, onClick }) {
+  const slColor = SL_LABEL_COLOR[sig.sl_label] || 'text-slate-400'
   return (
     <div onClick={() => onClick(sig)} className="bg-slate-800/50 border border-slate-700/40 rounded-xl p-3 cursor-pointer active:bg-slate-700/50">
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <span className="text-white font-bold">{sig.symbol}</span>
           <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${sig.strategy === 'S1' ? 'bg-violet-500/20 text-violet-300' : 'bg-cyan-500/20 text-cyan-300'}`}>{sig.strategy}</span>
+          {sig.timeframe && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-400">{sig.timeframe === 'Weekly (NSE)' ? 'W' : 'D'}</span>
+          )}
         </div>
-        <span className={`text-xs px-2 py-0.5 rounded-full ${STATUS_BADGE[sig.status] || STATUS_BADGE.active}`}>{sig.status?.replace('_',' ')}</span>
+        <span className={`text-xs px-2 py-0.5 rounded-full ${STATUS_BADGE[sig.status] || STATUS_BADGE.active}`}>{sig.status?.replace('_', ' ')}</span>
       </div>
       <div className="grid grid-cols-4 gap-1 text-xs">
         <div><div className="text-slate-500">Entry</div><div className="text-slate-200 font-medium">₹{sig.entry}</div></div>
@@ -39,7 +55,7 @@ function SignalMobileCard({ sig, onClick }) {
       </div>
       <div className="flex items-center justify-between mt-2 text-xs text-slate-400">
         <span>{sig.signal_date}</span>
-        <span className={sig.sl_pct <= 8 ? 'text-emerald-400' : sig.sl_pct <= 12 ? 'text-amber-400' : 'text-red-400'}>SL {sig.sl_pct}%</span>
+        <span className={slColor}>SL {sig.sl_pct}% · {sig.sl_label || '—'}</span>
         <span className={sig.rr1 >= 2 ? 'text-emerald-400' : sig.rr1 >= 1 ? 'text-amber-400' : 'text-red-400'}>R:R 1:{sig.rr1}</span>
       </div>
     </div>
@@ -56,8 +72,8 @@ export default function Signals() {
     setLoading(true)
     try {
       const params = {}
-      if (filters.strategy) params.strategy = filters.strategy
-      if (filters.status)   params.status   = filters.status
+      if (filters.strategy)  params.strategy  = filters.strategy
+      if (filters.status)    params.status    = filters.status
       if (filters.from_date) params.from_date = filters.from_date
       if (filters.to_date)   params.to_date   = filters.to_date
       const data = await fetchSignalHistory(params)
@@ -131,21 +147,40 @@ export default function Signals() {
             <tbody>
               {loading && <tr><td colSpan={11} className="text-center text-slate-500 py-16">Loading…</td></tr>}
               {!loading && signals.length === 0 && <tr><td colSpan={11} className="text-center text-slate-500 py-16">No signals found</td></tr>}
-              {signals.map(sig => (
-                <tr key={sig.id} onClick={() => setSelected(sig)} className="border-b border-slate-700/30 hover:bg-slate-700/30 cursor-pointer transition-colors">
-                  <td className="px-4 py-3 font-semibold text-white">{sig.symbol}</td>
-                  <td className="px-4 py-3"><span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${sig.strategy === 'S1' ? 'bg-violet-500/20 text-violet-300' : 'bg-cyan-500/20 text-cyan-300'}`}>{sig.strategy}</span></td>
-                  <td className="px-4 py-3 text-slate-400">{sig.signal_date}</td>
-                  <td className="px-4 py-3 tabular-nums text-slate-200">₹{sig.entry}</td>
-                  <td className="px-4 py-3 tabular-nums text-red-400">₹{sig.sl}</td>
-                  <td className="px-4 py-3 tabular-nums text-amber-400">₹{sig.t1}</td>
-                  <td className="px-4 py-3 tabular-nums text-emerald-400">₹{sig.t2}</td>
-                  <td className={`px-4 py-3 tabular-nums font-medium ${sig.sl_pct <= 8 ? 'text-emerald-400' : sig.sl_pct <= 12 ? 'text-amber-400' : 'text-red-400'}`}>{sig.sl_pct}%</td>
-                  <td className={`px-4 py-3 tabular-nums font-medium ${sig.rr1 >= 2 ? 'text-emerald-400' : sig.rr1 >= 1 ? 'text-amber-400' : 'text-red-400'}`}>1:{sig.rr1} / 1:{sig.rr2}</td>
-                  <td className="px-4 py-3 text-slate-300">{sig.qty} + {sig.qty_half}</td>
-                  <td className="px-4 py-3"><span className={`text-xs px-2 py-0.5 rounded-full ${STATUS_BADGE[sig.status] || STATUS_BADGE.active}`}>{sig.status?.replace('_',' ')}</span></td>
-                </tr>
-              ))}
+              {signals.map(sig => {
+                const slColor = SL_LABEL_COLOR[sig.sl_label] || 'text-slate-400'
+                return (
+                  <tr key={sig.id} onClick={() => setSelected(sig)} className="border-b border-slate-700/30 hover:bg-slate-700/30 cursor-pointer transition-colors">
+                    <td className="px-4 py-3 font-semibold text-white">
+                      {sig.symbol}
+                      {sig.timeframe && (
+                        <span className="ml-1.5 text-xs px-1 py-0.5 rounded bg-slate-700 text-slate-400">
+                          {sig.timeframe === 'Weekly (NSE)' ? 'W' : 'D'}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${sig.strategy === 'S1' ? 'bg-violet-500/20 text-violet-300' : 'bg-cyan-500/20 text-cyan-300'}`}>{sig.strategy}</span>
+                    </td>
+                    <td className="px-4 py-3 text-slate-400">{sig.signal_date}</td>
+                    <td className="px-4 py-3 tabular-nums text-slate-200">₹{sig.entry}</td>
+                    <td className="px-4 py-3 tabular-nums text-red-400">₹{sig.sl}</td>
+                    <td className="px-4 py-3 tabular-nums text-amber-400">₹{sig.t1}</td>
+                    <td className="px-4 py-3 tabular-nums text-emerald-400">₹{sig.t2}</td>
+                    <td className={`px-4 py-3 tabular-nums font-medium`}>
+                      <span className={slColor}>{sig.sl_pct}%</span>
+                      <span className="ml-1 text-xs text-slate-500">{sig.sl_label}</span>
+                    </td>
+                    <td className={`px-4 py-3 tabular-nums font-medium ${sig.rr1 >= 2 ? 'text-emerald-400' : sig.rr1 >= 1 ? 'text-amber-400' : 'text-red-400'}`}>
+                      1:{sig.rr1} / 1:{sig.rr2}
+                    </td>
+                    <td className="px-4 py-3 text-slate-300">{sig.qty} ({sig.qty_half}+{sig.qty - sig.qty_half})</td>
+                    <td className="px-4 py-3">
+                      <span className={`text-xs px-2 py-0.5 rounded-full ${STATUS_BADGE[sig.status] || STATUS_BADGE.active}`}>{sig.status?.replace('_', ' ')}</span>
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
@@ -158,14 +193,28 @@ export default function Signals() {
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h2 className="text-white text-xl font-bold">{selected.symbol}</h2>
-                <p className="text-slate-400 text-sm">{selected.strategy} · {selected.signal_date}</p>
+                <p className="text-slate-400 text-sm">
+                  {selected.strategy} · {selected.signal_date}
+                  {selected.timeframe && <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-slate-700">{selected.timeframe}</span>}
+                </p>
               </div>
               <button onClick={() => setSelected(null)} className="text-slate-500 hover:text-white p-1">
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
               </button>
             </div>
             <div className="grid grid-cols-2 gap-2 text-sm">
-              {[['Entry',`₹${selected.entry}`,'text-slate-200'],['Stop Loss',`₹${selected.sl}`,'text-red-400'],['Target 1',`₹${selected.t1}`,'text-amber-400'],['Target 2',`₹${selected.t2}`,'text-emerald-400'],['SL %',`${selected.sl_pct}%`,'text-slate-300'],['ATR',`₹${selected.atr}`,'text-slate-300'],['R:R (T1)',`1:${selected.rr1}`,'text-slate-300'],['R:R (T2)',`1:${selected.rr2}`,'text-slate-300'],['Qty (full)',selected.qty,'text-slate-300'],['Qty (half)',selected.qty_half,'text-slate-300']].map(([label,value,cls]) => (
+              {[
+                ['Entry', `₹${selected.entry}`, 'text-slate-200'],
+                ['Stop Loss', `₹${selected.sl}`, 'text-red-400'],
+                ['Target 1', `₹${selected.t1}`, 'text-amber-400'],
+                ['Target 2', `₹${selected.t2}`, 'text-emerald-400'],
+                ['SL %', `${selected.sl_pct}% · ${selected.sl_label || '—'}`, SL_LABEL_COLOR[selected.sl_label] || 'text-slate-300'],
+                ['ATR', `₹${selected.atr}`, 'text-slate-300'],
+                ['R:R (T1)', `1:${selected.rr1}`, 'text-slate-300'],
+                ['R:R (T2)', `1:${selected.rr2}`, 'text-slate-300'],
+                ['Qty (T1)', selected.qty_half, 'text-slate-300'],
+                ['Qty (T2)', selected.qty - selected.qty_half, 'text-slate-300'],
+              ].map(([label, value, cls]) => (
                 <div key={label} className="bg-slate-900/50 rounded-xl p-3">
                   <div className="text-slate-500 text-xs mb-1">{label}</div>
                   <div className={`font-semibold ${cls}`}>{value}</div>

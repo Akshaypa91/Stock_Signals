@@ -58,7 +58,7 @@ export default function Navbar() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
             </svg>
           </div>
-          <span className="text-white font-bold text-sm">Stock Signals</span>
+          <span className="text-white font-bold text-sm">Investors Way</span>
         </div>
 
         {/* Desktop nav */}
