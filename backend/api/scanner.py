@@ -10,8 +10,8 @@ from api.websocket_manager import ws_manager
 from upstox.instruments import (
     get_nifty200_instrument_keys,
     get_nifty500_instrument_keys,
-    NIFTY_200_SYMBOLS,
-    NIFTY_500_SYMBOLS,
+    ALL_NSE_SYMBOLS,
+    ALL_NSE_SYMBOLS,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,11 +29,11 @@ async def run_scanner(
     Runs in background — check /signals for results.
     """
     if universe == "n200":
-        symbols = list(NIFTY_200_SYMBOLS)
+        symbols = list(ALL_NSE_SYMBOLS)
     elif universe == "n500":
-        symbols = list(NIFTY_500_SYMBOLS)
+        symbols = list(ALL_NSE_SYMBOLS)
     else:
-        symbols = list(NIFTY_500_SYMBOLS)   # 500 is superset of 200
+        symbols = list(ALL_NSE_SYMBOLS)   # 500 is superset of 200
 
     logger.info("Manual scan triggered: universe=%s symbols=%d", universe, len(symbols))
     background_tasks.add_task(_scan_and_broadcast, symbols, db)
