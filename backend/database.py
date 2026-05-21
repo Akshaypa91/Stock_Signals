@@ -2,7 +2,6 @@
 database.py
 ===========
 Async SQLAlchemy engine + session factory for PostgreSQL.
-Uses asyncpg driver (postgresql+asyncpg://...).
 """
 
 import logging
@@ -19,15 +18,11 @@ from sqlalchemy.orm import DeclarativeBase
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
 _raw_url = os.environ.get(
     "DATABASE_URL",
     "postgresql://user:password@localhost:5432/investorsway",
 )
 
-# Convert standard postgresql:// → asyncpg driver URL
 DATABASE_URL = _raw_url.replace(
     "postgresql://", "postgresql+asyncpg://"
 ).replace(
@@ -36,16 +31,13 @@ DATABASE_URL = _raw_url.replace(
 
 engine: AsyncEngine = create_async_engine(
     DATABASE_URL,
-    echo=False,           # set True for SQL debug logging
+    echo=False,
     pool_size=10,
     max_overflow=20,
-    pool_pre_ping=True,   # detect stale connections
-    pool_recycle=3600,    # recycle connections every hour
+    pool_pre_ping=True,
+    pool_recycle=3600,
 )
 
-# ---------------------------------------------------------------------------
-# Session factory
-# ---------------------------------------------------------------------------
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
@@ -55,24 +47,11 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
-# ---------------------------------------------------------------------------
-# Base class for all ORM models
-# ---------------------------------------------------------------------------
 class Base(DeclarativeBase):
     pass
 
 
-# ---------------------------------------------------------------------------
-# Dependency for FastAPI routes
-# ---------------------------------------------------------------------------
 async def get_db() -> AsyncSession:
-    """
-    FastAPI dependency that yields an async DB session.
-
-    Usage in route:
-        async def my_route(db: AsyncSession = Depends(get_db)):
-            ...
-    """
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -82,27 +61,25 @@ async def get_db() -> AsyncSession:
             raise
 
 
-# ---------------------------------------------------------------------------
-# Init helper called from main.py lifespan
-# ---------------------------------------------------------------------------
 async def init_db() -> None:
-    """Create all tables if they don't exist, and apply incremental migrations."""
-    from models import signal, trade  # noqa: F401 — registers models
+    """Create tables + apply incremental migrations on every startup."""
+    from models import signal, trade  # noqa: F401
+
     async with engine.begin() as conn:
-        # Create any missing tables (idempotent)
+        # Create missing tables
         await conn.run_sync(Base.metadata.create_all)
 
-        # Migration: add sl_label column (Indian market SL quality: Good/OK/Wide)
+        # Migration: add sl_label column
         await conn.execute(text(
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS sl_label VARCHAR(20)"
         ))
 
-        # Migration: add timeframe column (Weekly (NSE) / Daily (NSE))
+        # Migration: add timeframe column
         await conn.execute(text(
             "ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe VARCHAR(20)"
         ))
 
-        # Backfill sl_label for any existing rows that don't have it yet
+        # Backfill sl_label for existing rows
         await conn.execute(text("""
             UPDATE signals
             SET sl_label = CASE
@@ -113,11 +90,35 @@ async def init_db() -> None:
             WHERE sl_label IS NULL AND sl_pct IS NOT NULL
         """))
 
-        # Backfill timeframe for existing rows (all were daily scans)
+        # Backfill timeframe for existing rows
         await conn.execute(text("""
             UPDATE signals
             SET timeframe = 'Daily (NSE)'
             WHERE timeframe IS NULL
+        """))
+
+        # Migration: add unique constraint to prevent duplicate signals
+        # (symbol + strategy + signal_date must be unique)
+        await conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'uq_signal_symbol_strategy_date'
+                ) THEN
+                    -- First remove existing duplicates keeping lowest id
+                    DELETE FROM signals
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM signals
+                        GROUP BY symbol, strategy, signal_date
+                    );
+                    -- Then add unique constraint
+                    ALTER TABLE signals
+                    ADD CONSTRAINT uq_signal_symbol_strategy_date
+                    UNIQUE (symbol, strategy, signal_date);
+                END IF;
+            END $$;
         """))
 
     logger.info("Database tables initialised and migrations applied")
