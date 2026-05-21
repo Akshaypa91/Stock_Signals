@@ -8,16 +8,17 @@ Upstox publishes a master CSV at:
 
 Downloads + caches in Redis (TTL 24h) and builds in-memory dict for fast lookup.
 
-Symbol normalization applied:
-  BAJAJ-AUTO  → also registered as BAJAJ_AUTO
-  M&M         → also registered as MM
-  L&T         → also registered as LT
+Equity filter: ISIN must start with "INE" (real NSE equities only — filters bonds/tbills)
+Symbol alias normalization:
+  BAJAJ-AUTO  → also BAJAJ_AUTO
+  M&M         → also MM
 """
 
 import csv
 import gzip
 import io
 import logging
+import re
 from typing import Optional
 
 import httpx
@@ -32,9 +33,12 @@ _REDIS_KEY = "upstox:instruments:nse"
 _REDIS_TTL = 86400  # 24 hours
 
 # In-process cache
-_symbol_map:  dict[str, str]  = {}   # symbol → instrument_key
-_symbol_meta: dict[str, dict] = {}   # symbol → {instrument_key, name, isin}
+_symbol_map:  dict[str, str]  = {}
+_symbol_meta: dict[str, dict] = {}
 _loaded = False
+
+# Regex: valid NSE equity symbols are 1–20 uppercase alphanum + hyphen/ampersand
+_VALID_SYMBOL = re.compile(r'^[A-Z0-9&\-]{1,20}$')
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +47,7 @@ _loaded = False
 
 async def get_instrument_key(symbol: str) -> Optional[str]:
     await _ensure_loaded()
-    normalized = _normalize(symbol)
-    key = _symbol_map.get(normalized)
+    key = _symbol_map.get(_normalize(symbol))
     if not key:
         logger.warning("Symbol '%s' not found in instruments master", symbol)
     return key
@@ -52,10 +55,7 @@ async def get_instrument_key(symbol: str) -> Optional[str]:
 
 async def get_instrument_keys_bulk(symbols: list[str]) -> dict[str, Optional[str]]:
     await _ensure_loaded()
-    return {
-        sym: _symbol_map.get(_normalize(sym))
-        for sym in symbols
-    }
+    return {sym: _symbol_map.get(_normalize(sym)) for sym in symbols}
 
 
 async def search_instruments(query: str, limit: int = 20) -> list[dict]:
@@ -78,12 +78,16 @@ async def search_instruments(query: str, limit: int = 20) -> list[dict]:
 async def reload_instruments() -> int:
     """Force-reload instruments from Upstox. Clears Redis + in-memory cache."""
     global _loaded
-    redis = await get_redis()
-    await redis.delete(_REDIS_KEY)
+    try:
+        redis = await get_redis()
+        await redis.delete(_REDIS_KEY)
+    except Exception as e:
+        logger.warning("Redis clear failed during reload: %s", e)
+
     _symbol_map.clear()
     _symbol_meta.clear()
     _loaded = False
-    await _ensure_loaded()
+    await _load_instruments()
     return len(_symbol_map)
 
 
@@ -92,7 +96,6 @@ async def reload_instruments() -> int:
 # ---------------------------------------------------------------------------
 
 async def _ensure_loaded() -> None:
-    global _loaded
     if _loaded and _symbol_map:
         return
     await _load_instruments()
@@ -109,18 +112,23 @@ async def _load_instruments() -> None:
         _parse_csv_text(cached)
     else:
         logger.info("Downloading instruments master from Upstox...")
-        raw_bytes = await _download_instruments()
-        raw_str   = raw_bytes.decode("utf-8", errors="replace")
-        _parse_csv_text(raw_str)
-        await redis.set(_REDIS_KEY, raw_str, ex=_REDIS_TTL)
-        logger.info("Instruments cached: %d NSE_EQ symbols", len(_symbol_map))
+        try:
+            raw_bytes = await _download_instruments()
+            raw_str   = raw_bytes.decode("utf-8", errors="replace")
+            _parse_csv_text(raw_str)
+            await redis.set(_REDIS_KEY, raw_str, ex=_REDIS_TTL)
+            logger.info("Instruments cached: %d equity symbols", len(_symbol_map))
+        except Exception as e:
+            logger.error("Failed to download instruments: %s", e)
+            _loaded = True  # prevent infinite retry loop
+            return
 
     _loaded = True
-    logger.info("Instruments loaded: %d NSE_EQ symbols available", len(_symbol_map))
+    logger.info("Instruments ready: %d NSE equity symbols", len(_symbol_map))
 
 
 async def _download_instruments() -> bytes:
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         resp = await client.get(INSTRUMENTS_URL)
 
     if resp.status_code != 200:
@@ -129,14 +137,14 @@ async def _download_instruments() -> bytes:
     try:
         return gzip.decompress(resp.content)
     except Exception:
-        return resp.content  # already plain CSV
+        return resp.content
 
 
 def _parse_csv_text(text: str) -> None:
     """
-    Parse Upstox NSE CSV and populate _symbol_map + _symbol_meta.
-    Only NSE_EQ equities are indexed.
-    Also registers normalized aliases (BAJAJ-AUTO → BAJAJ_AUTO etc.)
+    Parse Upstox NSE CSV.
+    Filters: NSE_EQ prefix + ISIN starts with INE (real equities only).
+    Bonds, T-Bills, ETFs filtered out.
     """
     _symbol_map.clear()
     _symbol_meta.clear()
@@ -145,32 +153,41 @@ def _parse_csv_text(text: str) -> None:
     count = 0
 
     for row in reader:
-        row = {k.strip(): v.strip() for k, v in row.items()}
+        row = {k.strip(): v.strip() for k, v in row.items() if k}
 
-        instrument_key   = row.get("instrument_key", "")
-        symbol           = row.get("tradingsymbol", "").upper().strip()
-        name             = row.get("name", "")
-        isin             = row.get("isin", "")
-        instrument_type  = row.get("instrument_type", "")
+        instrument_key = row.get("instrument_key", "")
+        symbol         = row.get("tradingsymbol", "").upper().strip()
+        name           = row.get("name", "")
+        isin           = row.get("isin", "")
+        lot_size       = row.get("lot_size", "1")
 
-        # Only NSE equities
+        # ── Filter 1: Must be NSE_EQ ──────────────────────────────────────
         if not instrument_key.startswith("NSE_EQ"):
             continue
-        if instrument_type not in ("", "EQ", "EQUITY"):
+
+        # ── Filter 2: ISIN must start with INE (Indian equity ISIN) ──────
+        # Bonds: IN0xxx, T-Bills: IN0xxx, ETFs: INFxxx
+        # Real equities: INExxx
+        if not isin.startswith("INE"):
             continue
-        if not symbol:
+
+        # ── Filter 3: Valid symbol pattern ───────────────────────────────
+        if not symbol or not _VALID_SYMBOL.match(symbol):
             continue
+
+        # ── Filter 4: lot_size == 1 (not derivatives) ────────────────────
+        try:
+            if int(lot_size) != 1:
+                continue
+        except (ValueError, TypeError):
+            pass
 
         meta = {"instrument_key": instrument_key, "name": name, "isin": isin}
 
-        # Register primary symbol
         _symbol_map[symbol]  = instrument_key
         _symbol_meta[symbol] = meta
 
-        # Register normalized aliases so both forms work:
-        #   BAJAJ-AUTO  ↔  BAJAJ_AUTO
-        #   M&M         ↔  MM
-        #   M&MFIN      ↔  MMFIN
+        # Register aliases
         for alias in _get_aliases(symbol):
             if alias not in _symbol_map:
                 _symbol_map[alias]  = instrument_key
@@ -179,43 +196,32 @@ def _parse_csv_text(text: str) -> None:
         count += 1
 
     if count == 0:
-        logger.error(
-            "No NSE_EQ instruments parsed! CSV preview: %s", text[:300]
-        )
+        logger.error("No instruments parsed! CSV preview:\n%s", text[:500])
+    else:
+        logger.info("Parsed %d NSE equity instruments (bonds/ETFs filtered)", count)
 
 
 def _normalize(symbol: str) -> str:
-    """Normalize symbol for lookup."""
     return symbol.upper().strip()
 
 
 def _get_aliases(symbol: str) -> list[str]:
-    """
-    Return alternate forms of a symbol that users might use.
-    e.g. BAJAJ-AUTO → [BAJAJ_AUTO], M&M → [MM], LT → [L&T]
-    """
+    """Register alternate forms: BAJAJ-AUTO↔BAJAJ_AUTO, M&M↔MM"""
     aliases = []
-
-    # Hyphen ↔ underscore
     if "-" in symbol:
         aliases.append(symbol.replace("-", "_"))
     if "_" in symbol:
         aliases.append(symbol.replace("_", "-"))
-
-    # Ampersand removal (M&M → MM, M&MFIN → MMFIN)
     if "&" in symbol:
         aliases.append(symbol.replace("&", ""))
-
     return aliases
 
 
 # ---------------------------------------------------------------------------
-# Nifty 200 / Nifty 500 universe
-# Uses Upstox tradingsymbol format exactly as it appears in instruments master
+# Nifty universe sets
 # ---------------------------------------------------------------------------
 
 NIFTY_200_SYMBOLS: set[str] = {
-    # Index heavyweights
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR",
     "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "BAJFINANCE", "HCLTECH",
     "MARUTI", "AXISBANK", "ASIANPAINT", "SUNPHARMA", "TITAN", "WIPRO",
@@ -227,48 +233,32 @@ NIFTY_200_SYMBOLS: set[str] = {
     "BAJAJ-AUTO", "MARICO", "GODREJCP", "PIDILITIND", "BERGEPAINT",
     "HAVELLS", "VOLTAS", "MUTHOOTFIN", "CHOLAFIN", "TORNTPHARM",
     "LUPIN", "BIOCON", "ALKEM", "AUROPHARMA", "MANKIND", "ABBOTINDIA",
-    # Banks
     "CANBK", "BANKBARODA", "PNB", "UNIONBANK", "FEDERALBNK", "IDFCFIRSTB",
     "BANDHANBNK", "RBLBANK", "KARURVYSYA",
-    # Industrials
     "SIEMENS", "ABB", "BHEL", "HAL", "BEL", "GRINDWELL",
     "CUMMINSIND", "THERMAX", "SKFINDIA",
-    # Consumer/retail
     "DMART", "TRENT", "NYKAA", "ZOMATO", "NAUKRI", "INDIAMART",
     "IRCTC", "CONCOR",
-    # Real estate
     "OBEROIRLTY", "DLF", "GODREJPROP", "PRESTIGE",
-    # Chemicals
-    "PIDILITIND", "ASTRAL", "SUPREMEIND", "ATUL",
-    # Metals
+    "ASTRAL", "SUPREMEIND", "ATUL",
     "SAIL", "HINDALCO", "VEDL", "NMDC", "NATIONALUM",
-    # Cement
     "AMBUJACEM", "ACC", "RAMCOCEM",
-    # Auto ancillary
     "MOTHERSON", "BALKRISIND", "APOLLOTYRE", "MRF", "CEATLTD",
-    # Insurance/Finance
     "MFSL", "ICICIGI", "SBICARD",
-    # FMCG
     "ITC", "PAGEIND", "BATAINDIA",
-    # Telecom/IT
     "TATACOMM", "POLYCAB", "KPITTECH", "LTTS", "PERSISTENT", "COFORGE",
     "MPHASIS", "TATAELXSI", "DIXON",
-    # Media
     "ZEEL", "SUNTV",
-    # Healthcare
     "LALPATHLAB", "METROPOLIS",
-    # Financials
     "MCX", "BSE", "CDSL",
-    "IRFC", "RECLTD", "PFC", "HUDCO",
+    "RECLTD", "PFC", "HUDCO", "IRFC",
     "NHPC", "SJVN", "TORNTPOWER",
-    # Pharma
     "PFIZER", "GLAXO", "NAVINFLUOR", "DEEPAKNTR",
-    # Energy
     "TATAPOWER", "ADANIGREEN",
+    "M&M",
 }
 
 NIFTY_500_SYMBOLS: set[str] = NIFTY_200_SYMBOLS | {
-    # Extended universe
     "APLAPOLLO", "JINDALSAW", "JSWENERGY", "JPPOWER",
     "SUZLON", "INOXWIND", "CESC",
     "RATNAMANI", "WELCORP", "MANAPPURAM",
@@ -285,24 +275,22 @@ NIFTY_500_SYMBOLS: set[str] = NIFTY_200_SYMBOLS | {
     "HAPPSTMNDS", "LATENTVIEW", "ROUTE", "INTELLECT",
     "TANLA", "MASTEK", "SONATSOFTW",
     "CAMPUS", "METROBRAND", "MANYAVAR",
-    "PRINCEPIPE", "FINPIPE", "HATSUN", "DODLA",
+    "PRINCEPIPE", "HATSUN", "DODLA",
     "WESTLIFE", "DEVYANI", "JUBLFOOD",
-    "JUBLPHARMA",
-    "GLAND", "LAURUSLABS", "STRIDES",
-    "KRBL", "PATANJALI", "BIKAJI",
+    "JUBLPHARMA", "GLAND", "LAURUSLABS", "STRIDES",
+    "KRBL", "BIKAJI",
     "ZYDUSLIFE", "CAPLIPOINT",
     "KFINTECH", "CAMS",
     "MEDPLUS", "KIMS",
-    "SENCO", "KALYANKJIL", "THANGAMAYL",
+    "KALYANKJIL", "THANGAMAYL",
     "ZENSARTECH", "NEWGEN",
-    "NSLNISP", "IIFL",
-    "HEXAWARE", "NIITTECH",
     "SRF", "CENTURYPLY",
     "GODREJIND", "AMBER",
-    "NETWORK18",
     "CRISIL",
     "EXIDEIND", "AMARAJABAT", "TVSMOTOR", "ENDURANCE",
-    "RECLTD",
+    "HEXAWARE", "NUVAMA",
+    "NETWORK18",
+    "DEEPAKFERT",
 }
 
 
@@ -317,36 +305,41 @@ async def get_nifty500_instrument_keys() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI router — mount in main.py for admin endpoints
+# FastAPI router
 # ---------------------------------------------------------------------------
 
 from fastapi import APIRouter
 instruments_router = APIRouter(prefix="/instruments", tags=["instruments"])
 
+
 @instruments_router.post("/reload", summary="Force reload instruments master from Upstox")
 async def reload_instruments_endpoint() -> dict:
-    """
-    Force-downloads fresh instruments CSV from Upstox.
-    Call this if symbols are showing as 'not found'.
-    Takes ~3-5 seconds.
-    """
-    count = await reload_instruments()
-    return {
-        "status": "ok",
-        "symbols_loaded": count,
-        "message": f"Loaded {count} NSE_EQ symbols from Upstox instruments master",
-    }
+    """Force-download fresh instruments CSV. Call if symbols show as 'not found'."""
+    try:
+        count = await reload_instruments()
+        return {
+            "status": "ok",
+            "symbols_loaded": count,
+            "message": f"Loaded {count} NSE equity symbols",
+        }
+    except Exception as e:
+        logger.exception("Reload failed: %s", e)
+        return {"status": "error", "message": str(e)}
+
 
 @instruments_router.get("/search", summary="Search instruments by symbol or name")
 async def search_endpoint(q: str, limit: int = 10) -> dict:
     results = await search_instruments(q, limit)
     return {"results": results, "count": len(results)}
 
+
 @instruments_router.get("/status", summary="Instruments master status")
 async def instruments_status() -> dict:
     await _ensure_loaded()
+    equity_symbols = [s for s in _symbol_map.keys() if _VALID_SYMBOL.match(s) and len(s) <= 15]
     return {
         "loaded": _loaded,
-        "symbol_count": len(_symbol_map),
-        "sample": list(_symbol_map.keys())[:10],
+        "total_keys": len(_symbol_map),
+        "equity_count": len(equity_symbols),
+        "sample_equities": sorted(equity_symbols)[:15],
     }
