@@ -2,20 +2,26 @@
 upstox/instruments.py
 =====================
 Loads NSE instruments from bundled CSV file (NSE_instruments.csv).
-Render blocks outbound calls to Upstox CDN, so we bundle the CSV directly.
 
-To update instruments (monthly):
+CSV columns: instrument_key, exchange_token, tradingsymbol, name,
+             last_price, expiry, strike, tick_size, lot_size,
+             instrument_type, option_type, exchange
+
+Equity filter:
+  - instrument_key starts with NSE_EQ
+  - lot_size == 1  (bonds have lot_size=100)
+  - tradingsymbol contains ONLY letters (no digits) — filters bonds like 749RJ35
+
+To refresh instruments (do monthly):
   cd backend/upstox
   curl -L "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz" -o NSE_instruments.csv.gz
   gunzip -f NSE_instruments.csv.gz
-  git add NSE_instruments.csv
-  git commit -m "update NSE instruments master"
+  git add NSE_instruments.csv && git commit -m "update NSE instruments"
 """
 
 import csv
 import io
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -24,17 +30,17 @@ from redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
-# Path to bundled CSV — same directory as this file
 _CSV_PATH = Path(__file__).parent / "NSE_instruments.csv"
-
-_REDIS_KEY = "upstox:instruments:nse_v2"
+_REDIS_KEY = "upstox:instruments:nse_v3"
 _REDIS_TTL = 86400
 
-_symbol_map:  dict[str, str]  = {}
-_symbol_meta: dict[str, dict] = {}
+_symbol_map: dict  = {}
+_symbol_meta: dict = {}
 _loaded = False
 
-_VALID_SYMBOL = re.compile(r'^[A-Z0-9&\-]{1,20}$')
+# Real equity symbols: letters only + hyphen/ampersand. No digits.
+# ZOMATO ✅  BAJAJ-AUTO ✅  M&M ✅  749RJ35 ❌  182D110626 ❌
+_EQUITY_RE = re.compile(r'^[A-Z][A-Z&-]{1,19}$')
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +55,12 @@ async def get_instrument_key(symbol: str) -> Optional[str]:
     return key
 
 
-async def get_instrument_keys_bulk(symbols: list[str]) -> dict[str, Optional[str]]:
+async def get_instrument_keys_bulk(symbols: list) -> dict:
     await _ensure_loaded()
     return {sym: _symbol_map.get(sym.upper().strip()) for sym in symbols}
 
 
-async def search_instruments(query: str, limit: int = 20) -> list[dict]:
+async def search_instruments(query: str, limit: int = 20) -> list:
     await _ensure_loaded()
     q = query.upper().strip()
     results = []
@@ -64,7 +70,6 @@ async def search_instruments(query: str, limit: int = 20) -> list[dict]:
                 "symbol": symbol,
                 "instrument_key": meta["instrument_key"],
                 "name": meta["name"],
-                "isin": meta["isin"],
             })
             if len(results) >= limit:
                 break
@@ -76,7 +81,6 @@ async def reload_instruments() -> int:
     _symbol_map.clear()
     _symbol_meta.clear()
     _loaded = False
-    # Clear Redis cache so it re-reads from CSV
     try:
         redis = await get_redis()
         await redis.delete(_REDIS_KEY)
@@ -87,7 +91,7 @@ async def reload_instruments() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Internal loader
+# Loader
 # ---------------------------------------------------------------------------
 
 async def _ensure_loaded() -> None:
@@ -99,38 +103,29 @@ async def _ensure_loaded() -> None:
 async def _load_instruments() -> None:
     global _loaded
 
-    # Try Redis cache first
+    # 1. Try Redis cache
     try:
         redis = await get_redis()
         cached = await redis.get(_REDIS_KEY)
         if cached:
-            logger.info("Loading instruments from Redis cache")
-            _parse_csv_text(cached)
+            _parse_csv(cached)
             _loaded = True
-            logger.info("Instruments ready: %d symbols (from Redis)", len(_symbol_map))
+            logger.info("Instruments loaded from Redis: %d symbols", len(_symbol_map))
             return
     except Exception as e:
-        logger.warning("Redis read failed: %s — loading from CSV file", e)
+        logger.warning("Redis read failed: %s", e)
 
-    # Load from bundled CSV file
+    # 2. Load from bundled CSV
     if not _CSV_PATH.exists():
-        logger.error(
-            "NSE_instruments.csv not found at %s\n"
-            "Run this on your Mac and commit the file:\n"
-            "  cd backend/upstox\n"
-            "  curl -L 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz' -o NSE_instruments.csv.gz\n"
-            "  gunzip -f NSE_instruments.csv.gz\n"
-            "  git add NSE_instruments.csv && git commit -m 'add NSE instruments'",
-            _CSV_PATH,
-        )
+        logger.error("NSE_instruments.csv not found at %s", _CSV_PATH)
         _loaded = True
         return
 
-    logger.info("Loading instruments from bundled CSV: %s", _CSV_PATH)
+    logger.info("Loading instruments from %s", _CSV_PATH)
     text = _CSV_PATH.read_text(encoding="utf-8", errors="replace")
-    _parse_csv_text(text)
+    _parse_csv(text)
 
-    # Cache in Redis so next startup is faster
+    # 3. Cache in Redis
     try:
         redis = await get_redis()
         await redis.set(_REDIS_KEY, text, ex=_REDIS_TTL)
@@ -141,12 +136,12 @@ async def _load_instruments() -> None:
     logger.info("Instruments ready: %d NSE equity symbols", len(_symbol_map))
 
 
-def _parse_csv_text(text: str) -> None:
+def _parse_csv(text: str) -> None:
     _symbol_map.clear()
     _symbol_meta.clear()
+    count = 0
 
     reader = csv.DictReader(io.StringIO(text))
-    count = 0
 
     for row in reader:
         row = {k.strip(): v.strip() for k, v in row.items() if k}
@@ -154,56 +149,54 @@ def _parse_csv_text(text: str) -> None:
         instrument_key = row.get("instrument_key", "")
         symbol         = row.get("tradingsymbol", "").upper().strip()
         name           = row.get("name", "")
-        lot_size        = row.get("lot_size", "1")
-        instrument_type = row.get("instrument_type", "")
+        lot_size_str   = row.get("lot_size", "1")
 
-        # Filter 1: NSE_EQ only
+        # Must be NSE equity
         if not instrument_key.startswith("NSE_EQ"):
             continue
 
-        # Filter 2: lot_size == 1 (bonds have lot_size=100)
+        # lot_size must be 1 — bonds/SDL have lot_size=100
         try:
-            if int(lot_size) != 1:
+            if int(lot_size_str) != 1:
                 continue
         except (ValueError, TypeError):
             pass
 
-        # Filter 3: Symbol letters only — no digits
-        # ZOMATO✅ BAJAJ-AUTO✅ M&M✅ | 749RJ35❌ 182D110626❌
-        import re as _re
-        if not symbol or not _re.match(r'^[A-Z][A-Z&\-]{1,19}$', symbol):
+        # Symbol must be letters only — no digits
+        if not symbol or not _EQUITY_RE.match(symbol):
             continue
 
-        meta = {"instrument_key": instrument_key, "name": name, "isin": isin}
-        _symbol_map[symbol]  = instrument_key
+        meta = {"instrument_key": instrument_key, "name": name}
+        _symbol_map[symbol] = instrument_key
         _symbol_meta[symbol] = meta
 
-        for alias in _get_aliases(symbol):
+        # Register aliases: BAJAJ-AUTO <-> BAJAJ_AUTO, M&M -> MM
+        for alias in _aliases(symbol):
             if alias not in _symbol_map:
-                _symbol_map[alias]  = instrument_key
+                _symbol_map[alias] = instrument_key
                 _symbol_meta[alias] = meta
 
         count += 1
 
-    logger.info("Parsed %d NSE equity instruments", count)
+    logger.info("Parsed %d equity instruments (bonds filtered)", count)
 
 
-def _get_aliases(symbol: str) -> list[str]:
-    aliases = []
+def _aliases(symbol: str) -> list:
+    out = []
     if "-" in symbol:
-        aliases.append(symbol.replace("-", "_"))
+        out.append(symbol.replace("-", "_"))
     if "_" in symbol:
-        aliases.append(symbol.replace("_", "-"))
+        out.append(symbol.replace("_", "-"))
     if "&" in symbol:
-        aliases.append(symbol.replace("&", ""))
-    return aliases
+        out.append(symbol.replace("&", ""))
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Nifty universe
 # ---------------------------------------------------------------------------
 
-NIFTY_200_SYMBOLS: set[str] = {
+NIFTY_200_SYMBOLS: set = {
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR",
     "SBIN", "BHARTIARTL", "KOTAKBANK", "LT", "BAJFINANCE", "HCLTECH",
     "MARUTI", "AXISBANK", "ASIANPAINT", "SUNPHARMA", "TITAN", "WIPRO",
@@ -231,7 +224,7 @@ NIFTY_200_SYMBOLS: set[str] = {
     "TATAPOWER", "ADANIGREEN", "M&M",
 }
 
-NIFTY_500_SYMBOLS: set[str] = NIFTY_200_SYMBOLS | {
+NIFTY_500_SYMBOLS: set = NIFTY_200_SYMBOLS | {
     "APLAPOLLO", "JINDALSAW", "JSWENERGY", "JPPOWER", "SUZLON", "INOXWIND",
     "CESC", "RATNAMANI", "WELCORP", "MANAPPURAM", "M&MFIN", "SCHAEFFLER",
     "TIMKEN", "KPRMILL", "ARVIND", "RAYMOND", "TRIDENT", "WELSPUNLIV",
@@ -250,12 +243,12 @@ NIFTY_500_SYMBOLS: set[str] = NIFTY_200_SYMBOLS | {
 }
 
 
-async def get_nifty200_instrument_keys() -> dict[str, str]:
+async def get_nifty200_instrument_keys() -> dict:
     result = await get_instrument_keys_bulk(list(NIFTY_200_SYMBOLS))
     return {k: v for k, v in result.items() if v is not None}
 
 
-async def get_nifty500_instrument_keys() -> dict[str, str]:
+async def get_nifty500_instrument_keys() -> dict:
     result = await get_instrument_keys_bulk(list(NIFTY_500_SYMBOLS))
     return {k: v for k, v in result.items() if v is not None}
 
@@ -269,11 +262,12 @@ instruments_router = APIRouter(prefix="/instruments", tags=["instruments"])
 
 
 @instruments_router.post("/reload")
-async def reload_instruments_endpoint() -> dict:
+async def reload_endpoint() -> dict:
     try:
         count = await reload_instruments()
         return {"status": "ok", "symbols_loaded": count}
     except Exception as e:
+        logger.exception("Reload failed")
         return {"status": "error", "message": str(e)}
 
 
@@ -284,7 +278,7 @@ async def search_endpoint(q: str, limit: int = 10) -> dict:
 
 
 @instruments_router.get("/status")
-async def instruments_status() -> dict:
+async def status_endpoint() -> dict:
     await _ensure_loaded()
     return {
         "loaded": _loaded,
