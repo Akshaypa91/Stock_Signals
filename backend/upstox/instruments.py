@@ -154,20 +154,25 @@ def _parse_csv_text(text: str) -> None:
         instrument_key = row.get("instrument_key", "")
         symbol         = row.get("tradingsymbol", "").upper().strip()
         name           = row.get("name", "")
-        isin           = row.get("isin", "")
-        lot_size       = row.get("lot_size", "1")
+        lot_size        = row.get("lot_size", "1")
+        instrument_type = row.get("instrument_type", "")
 
+        # Filter 1: NSE_EQ only
         if not instrument_key.startswith("NSE_EQ"):
             continue
-        if not isin.startswith("INE"):
-            continue
-        if not symbol or not _VALID_SYMBOL.match(symbol):
-            continue
+
+        # Filter 2: lot_size == 1 (bonds have lot_size=100)
         try:
             if int(lot_size) != 1:
                 continue
         except (ValueError, TypeError):
             pass
+
+        # Filter 3: Symbol letters only — no digits
+        # ZOMATO✅ BAJAJ-AUTO✅ M&M✅ | 749RJ35❌ 182D110626❌
+        import re as _re
+        if not symbol or not _re.match(r'^[A-Z][A-Z&\-]{1,19}$', symbol):
+            continue
 
         meta = {"instrument_key": instrument_key, "name": name, "isin": isin}
         _symbol_map[symbol]  = instrument_key
