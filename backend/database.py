@@ -97,6 +97,11 @@ async def init_db() -> None:
             WHERE timeframe IS NULL
         """))
 
+        # Migration: add exit_qty column to trades table
+        await conn.execute(text(
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_qty INTEGER"
+        ))
+
         # Migration: add unique constraint to prevent duplicate signals
         # (symbol + strategy + signal_date must be unique)
         await conn.execute(text("""
